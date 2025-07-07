@@ -27,6 +27,10 @@ def create_custom_log_stream():
         # Create log group if it doesn't exist
         try:
             logs_client.create_log_group(logGroupName=CUSTOM_LOG_GROUP)
+            logs_client.put_retention_policy(
+                logGroupName=CUSTOM_LOG_GROUP,
+                retentionInDays=7
+            )
         except logs_client.exceptions.ResourceAlreadyExistsException:
             pass
             
@@ -87,6 +91,7 @@ def get_db_secrets(secret_name):
 def test_db_connection(db_params, log_stream_name):
     """Test the database connection with provided parameters"""
     connection = None
+    test_record = None
     try:
         log_msg = f"Attempting to connect to database at {db_params['host']}"
         logger.info(log_msg)
@@ -102,32 +107,67 @@ def test_db_connection(db_params, log_stream_name):
             logger.info(version_msg)
             log_to_custom_cloudwatch(version_msg, 'INFO', log_stream_name)
             
-            # Test write operation
+            # Create test table
             cursor.execute("""
                 CREATE TEMP TABLE IF NOT EXISTS lambda_test (
-                    id serial, 
+                    id serial PRIMARY KEY, 
                     timestamp timestamp,
                     test_value text
                 );
             """)
+            
+            # Insert test record
             cursor.execute("""
                 INSERT INTO lambda_test (timestamp, test_value) 
                 VALUES (current_timestamp, 'Lambda connectivity test') 
-                RETURNING *;
+                RETURNING id, timestamp, test_value;
             """)
             test_record = cursor.fetchone()
             record_msg = f"Test record inserted: {test_record}"
             logger.info(record_msg)
             log_to_custom_cloudwatch(record_msg, 'INFO', log_stream_name)
             
+            # Verify the record exists
+            cursor.execute("SELECT * FROM lambda_test WHERE id = %s;", (test_record[0],))
+            verify_record = cursor.fetchone()
+            verify_msg = f"Record verification: {verify_record}"
+            logger.info(verify_msg)
+            log_to_custom_cloudwatch(verify_msg, 'INFO', log_stream_name)
+            
+            # Delete the test record
+            if test_record:
+                cursor.execute("DELETE FROM lambda_test WHERE id = %s;", (test_record[0],))
+                delete_msg = f"Deleted test record with ID: {test_record[0]}"
+                logger.info(delete_msg)
+                log_to_custom_cloudwatch(delete_msg, 'INFO', log_stream_name)
+                
+                # Verify deletion
+                cursor.execute("SELECT * FROM lambda_test WHERE id = %s;", (test_record[0],))
+                verify_deletion = cursor.fetchone()
+                if not verify_deletion:
+                    logger.info("Record successfully deleted")
+                else:
+                    logger.warning("Record still exists after deletion")
+            
+            connection.commit()
+            
             return {
                 'status': 'success',
                 'version': db_version[0],
-                'test_record': test_record
+                'test_record': test_record,
+                'deleted_record_id': test_record[0] if test_record else None
             }
             
     except OperationalError as e:
         error_msg = f"Database connection failed: {str(e)}"
+        logger.error(error_msg)
+        log_to_custom_cloudwatch(error_msg, 'ERROR', log_stream_name)
+        return {
+            'status': 'failed',
+            'error': error_msg
+        }
+    except Exception as e:
+        error_msg = f"Database operation failed: {str(e)}"
         logger.error(error_msg)
         log_to_custom_cloudwatch(error_msg, 'ERROR', log_stream_name)
         return {
@@ -164,7 +204,7 @@ def lambda_handler(event, context):
         result = test_db_connection(db_params, log_stream_name)
         
         if result['status'] == 'success':
-            success_msg = "Successfully connected to Aurora PostgreSQL"
+            success_msg = "Successfully connected to and tested Aurora PostgreSQL"
             logger.info(success_msg)
             log_to_custom_cloudwatch(success_msg, 'INFO', log_stream_name)
             
@@ -173,7 +213,8 @@ def lambda_handler(event, context):
                 'body': {
                     'message': success_msg,
                     'version': result['version'],
-                    'test_record': result['test_record'],
+                    'test_record_inserted': result['test_record'],
+                    'deleted_record_id': result['deleted_record_id'],
                     'log_stream': log_stream_name
                 }
             }
